@@ -1,0 +1,13 @@
+## Interface: 120000, 110207, 50503, 38000, 20505, 11508
+## Title: Gold Log
+## Notes: Tracks gold and currency earnings per session, week, and month
+## Author: romses
+## Version: 1.0.0
+## SavedVariables: GoldLogDB
+## DefaultState: enabled
+
+libs\LibStub\LibStub.lua
+libs\CallbackHandler-1.0\CallbackHandler-1.0.lua
+libs\LibDataBroker-1.1\LibDataBroker-1.1.lua
+
+GoldLog.lua
