@@ -1,6 +1,9 @@
 -- GoldLog - Gold and Currency Tracking Addon
-local ADDON_NAME = "gold_log"
+local ADDON_NAME = "GoldLog"
 local GoldLog = {}
+
+-- Get localization table
+local L = LibStub("AceLocale-3.0"):GetLocale(ADDON_NAME)
 
 -- LibDataBroker support
 local LDB = LibStub and LibStub:GetLibrary("LibDataBroker-1.1", true)
@@ -17,16 +20,48 @@ local isVisible = false
 local sessionStartTime = 0
 local sessionStartCurrencies = {}
 local collapsedSections = {}
+local activeTab = "balance" -- "balance", "income", "expense"
 
--- UI Appearance Constants
-local FRAME_BG_COLOR_R = 0
-local FRAME_BG_COLOR_G = 0
+-- Transaction context tracking
+local transactionContext = {
+    currentContext = nil,  -- Current open frame/context
+    lastGold = 0,          -- Last known gold amount
+    contextTimeout = 0,    -- Timeout to clear context
+    pendingAmount = 0      -- Amount waiting for categorization
+}
+
+-- Transaction categories
+local CATEGORY = {
+    MERCHANT_BUY = "MERCHANT_BUY",
+    MERCHANT_SELL = "MERCHANT_SELL",
+    REPAIR = "REPAIR",
+    MAIL_SEND = "MAIL_SEND",
+    MAIL_RECEIVE = "MAIL_RECEIVE",
+    TRADE = "TRADE",
+    QUEST = "QUEST",
+    LOOT = "LOOT",
+    AUCTION_BUY = "AUCTION_BUY",
+    AUCTION_SELL = "AUCTION_SELL",
+    GUILD_BANK = "GUILD_BANK",
+    OTHER = "OTHER"
+}
+
+-- Forward declarations
+local UpdateDisplay
+
+-- UI Appearance Constants (Classic WoW Style)
+local FRAME_BG_COLOR_R = 0.1
+local FRAME_BG_COLOR_G = 0.05
 local FRAME_BG_COLOR_B = 0
-local FRAME_BG_ALPHA = 1
-local ROW_BG_COLOR_R = 0.2
-local ROW_BG_COLOR_G = 0.2
-local ROW_BG_COLOR_B = 0.2
-local ROW_BG_ALPHA = 0.6
+local FRAME_BG_ALPHA = 0.9
+local ROW_BG_COLOR_R = 0.18
+local ROW_BG_COLOR_G = 0.12
+local ROW_BG_COLOR_B = 0.06
+local ROW_BG_ALPHA = 0.5
+local HEADER_BG_COLOR_R = 0.25
+local HEADER_BG_COLOR_G = 0.16
+local HEADER_BG_COLOR_B = 0.0
+local HEADER_BG_ALPHA = 0.9
 
 -- Helper function to get current date string
 local function GetDateString()
@@ -41,6 +76,22 @@ end
 -- Helper function to get month string (year-month)
 local function GetMonthString()
     return date("%Y-%m")
+end
+
+-- Helper function to get day of month (1-31)
+local function GetDayOfMonth()
+    return tonumber(date("%d"))
+end
+
+-- Helper function to get day of week (1-7, Monday=1)
+local function GetDayOfWeek()
+    local day = tonumber(date("%w"))
+    -- Convert Sunday (0) to 7, rest stays same but shift by -1
+    if day == 0 then
+        return 7
+    else
+        return day
+    end
 end
 
 -- Get player's current gold
@@ -224,6 +275,76 @@ local function FormatGold(copper)
     return result
 end
 
+-- Set transaction context
+local function SetTransactionContext(context)
+    transactionContext.currentContext = context
+    transactionContext.contextTimeout = GetTime() + 2 -- 2 second timeout
+    transactionContext.lastGold = GetMoney()
+end
+
+-- Clear transaction context
+local function ClearTransactionContext()
+    transactionContext.currentContext = nil
+    transactionContext.contextTimeout = 0
+end
+
+-- Get current transaction category based on context
+local function GetTransactionCategory(amount)
+    -- Check if context is still valid
+    if transactionContext.contextTimeout > 0 and GetTime() > transactionContext.contextTimeout then
+        ClearTransactionContext()
+    end
+    
+    if not transactionContext.currentContext then
+        return CATEGORY.OTHER
+    end
+    
+    -- Determine category based on context and amount sign
+    local context = transactionContext.currentContext
+    
+    if context == "MERCHANT" then
+        return amount > 0 and CATEGORY.MERCHANT_SELL or CATEGORY.MERCHANT_BUY
+    elseif context == "REPAIR" then
+        return CATEGORY.REPAIR
+    elseif context == "MAIL" then
+        return amount > 0 and CATEGORY.MAIL_RECEIVE or CATEGORY.MAIL_SEND
+    elseif context == "TRADE" then
+        return CATEGORY.TRADE
+    elseif context == "QUEST" then
+        return CATEGORY.QUEST
+    elseif context == "LOOT" then
+        return CATEGORY.LOOT
+    elseif context == "AUCTION" then
+        return amount > 0 and CATEGORY.AUCTION_SELL or CATEGORY.AUCTION_BUY
+    elseif context == "GUILD_BANK" then
+        return CATEGORY.GUILD_BANK
+    end
+    
+    return CATEGORY.OTHER
+end
+
+-- Add transaction to history
+local function AddTransaction(playerName, amount, category, details)
+    local charData = GoldLogDB.characters[playerName]
+    if not charData or not charData.transactions then
+        return
+    end
+    
+    local transaction = {
+        timestamp = time(),
+        amount = amount,
+        category = category,
+        details = details or ""
+    }
+    
+    table.insert(charData.transactions, transaction)
+    
+    -- Keep only last 1000 transactions
+    while #charData.transactions > 1000 do
+        table.remove(charData.transactions, 1)
+    end
+end
+
 -- Initialize database structure
 local function InitializeDB()
     if not GoldLogDB.characters then
@@ -234,9 +355,41 @@ local function InitializeDB()
     
     if not GoldLogDB.characters[playerName] then
         GoldLogDB.characters[playerName] = {
-            dailyData = {},
-            currencies = {},
-            currencyData = {}
+            weekDays = {},      -- Buckets für 7 Wochentage
+            monthDays = {},     -- Buckets für 31 Tage im Monat
+            monthTotal = {},    -- Monatstotal
+            currencies = {},    -- Aktuelle Währungsstände
+            currencyData = {},  -- Währungsinformationen (Name, Icon)
+            transactions = {}   -- Transaction history (limited to last 1000)
+        }
+        
+        -- Initialize buckets
+        for i = 1, 7 do
+            GoldLogDB.characters[playerName].weekDays[i] = {
+                date = nil,
+                income = {},
+                expense = {},
+                incomeByCategory = {},
+                expenseByCategory = {}
+            }
+        end
+        
+        for i = 1, 31 do
+            GoldLogDB.characters[playerName].monthDays[i] = {
+                date = nil,
+                income = {},
+                expense = {},
+                incomeByCategory = {},
+                expenseByCategory = {}
+            }
+        end
+        
+        GoldLogDB.characters[playerName].monthTotal = {
+            month = nil,
+            income = {},
+            expense = {},
+            incomeByCategory = {},
+            expenseByCategory = {}
         }
         
         -- For new characters, initialize with current currency values as baseline
@@ -250,7 +403,84 @@ local function InitializeDB()
         end
     end
     
-    -- Ensure currency fields exist for existing characters
+    -- Migrate old data structure to new one
+    if GoldLogDB.characters[playerName].dailyData then
+        -- Clear old structure
+        GoldLogDB.characters[playerName].dailyData = nil
+    end
+    
+    -- Ensure all fields exist for existing characters
+    if not GoldLogDB.characters[playerName].weekDays then
+        GoldLogDB.characters[playerName].weekDays = {}
+        for i = 1, 7 do
+            GoldLogDB.characters[playerName].weekDays[i] = {
+                date = nil,
+                income = {},
+                expense = {},
+                incomeByCategory = {},
+                expenseByCategory = {}
+            }
+        end
+    else
+        -- Ensure byCategory fields exist
+        for i = 1, 7 do
+            if GoldLogDB.characters[playerName].weekDays[i] then
+                if not GoldLogDB.characters[playerName].weekDays[i].incomeByCategory then
+                    GoldLogDB.characters[playerName].weekDays[i].incomeByCategory = {}
+                end
+                if not GoldLogDB.characters[playerName].weekDays[i].expenseByCategory then
+                    GoldLogDB.characters[playerName].weekDays[i].expenseByCategory = {}
+                end
+            end
+        end
+    end
+    
+    if not GoldLogDB.characters[playerName].monthDays then
+        GoldLogDB.characters[playerName].monthDays = {}
+        for i = 1, 31 do
+            GoldLogDB.characters[playerName].monthDays[i] = {
+                date = nil,
+                income = {},
+                expense = {},
+                incomeByCategory = {},
+                expenseByCategory = {}
+            }
+        end
+    else
+        -- Ensure byCategory fields exist
+        for i = 1, 31 do
+            if GoldLogDB.characters[playerName].monthDays[i] then
+                if not GoldLogDB.characters[playerName].monthDays[i].incomeByCategory then
+                    GoldLogDB.characters[playerName].monthDays[i].incomeByCategory = {}
+                end
+                if not GoldLogDB.characters[playerName].monthDays[i].expenseByCategory then
+                    GoldLogDB.characters[playerName].monthDays[i].expenseByCategory = {}
+                end
+            end
+        end
+    end
+    
+    if not GoldLogDB.characters[playerName].monthTotal then
+        GoldLogDB.characters[playerName].monthTotal = {
+            month = nil,
+            income = {},
+            expense = {},
+            incomeByCategory = {},
+            expenseByCategory = {}
+        }
+    else
+        if not GoldLogDB.characters[playerName].monthTotal.incomeByCategory then
+            GoldLogDB.characters[playerName].monthTotal.incomeByCategory = {}
+        end
+        if not GoldLogDB.characters[playerName].monthTotal.expenseByCategory then
+            GoldLogDB.characters[playerName].monthTotal.expenseByCategory = {}
+        end
+    end
+    
+    if not GoldLogDB.characters[playerName].transactions then
+        GoldLogDB.characters[playerName].transactions = {}
+    end
+    
     if not GoldLogDB.characters[playerName].currencies then
         GoldLogDB.characters[playerName].currencies = {}
     end
@@ -261,35 +491,110 @@ local function InitializeDB()
     return playerName
 end
 
--- Update daily data
-local function UpdateDailyData(playerName, currencyChanges)
-    local dateStr = GetDateString()
-    local weekStr = GetWeekString()
-    local monthStr = GetMonthString()
+-- Update bucket data with automatic rollover
+local function UpdateBucketData(playerName, currencyChanges)
+    if not currencyChanges then return end
     
     local charData = GoldLogDB.characters[playerName]
+    local dateStr = GetDateString()
+    local monthStr = GetMonthString()
+    local dayOfWeek = GetDayOfWeek()
+    local dayOfMonth = GetDayOfMonth()
     
-    -- Initialize daily entry if needed
-    if not charData.dailyData[dateStr] then
-        charData.dailyData[dateStr] = {
-            week = weekStr,
-            month = monthStr,
-            currencies = {}
-        }
+    -- Update week day bucket (with rollover check)
+    local weekBucket = charData.weekDays[dayOfWeek]
+    if weekBucket.date ~= dateStr then
+        -- New day - reset bucket
+        weekBucket.date = dateStr
+        weekBucket.income = {}
+        weekBucket.expense = {}
     end
     
-    -- Update currency changes
-    if currencyChanges then
-        if not charData.dailyData[dateStr].currencies then
-            charData.dailyData[dateStr].currencies = {}
+    -- Update month day bucket (with rollover check)
+    local monthDayBucket = charData.monthDays[dayOfMonth]
+    if monthDayBucket.date ~= dateStr then
+        -- New day - reset bucket
+        monthDayBucket.date = dateStr
+        monthDayBucket.income = {}
+        monthDayBucket.expense = {}
+    end
+    
+    -- Update month total bucket (with rollover check)
+    local monthTotalBucket = charData.monthTotal
+    if monthTotalBucket.month ~= monthStr then
+        -- New month - reset bucket
+        monthTotalBucket.month = monthStr
+        monthTotalBucket.income = {}
+        monthTotalBucket.expense = {}
+    end
+    
+    -- Add changes to buckets (separate income/expense with categories)
+    for currencyID, change in pairs(currencyChanges) do
+        local cat = CATEGORY.OTHER
+        
+        -- Only track categories for Gold (currencyID == 0)
+        if currencyID == 0 then
+            cat = GetTransactionCategory(change)
+            
+            -- Add to transaction history for gold
+            AddTransaction(playerName, change, cat, nil)
         end
-        for currencyID, change in pairs(currencyChanges) do
-            if not charData.dailyData[dateStr].currencies[currencyID] then
-                charData.dailyData[dateStr].currencies[currencyID] = 0
+        
+        if change > 0 then
+            -- Income
+            weekBucket.income[currencyID] = (weekBucket.income[currencyID] or 0) + change
+            monthDayBucket.income[currencyID] = (monthDayBucket.income[currencyID] or 0) + change
+            monthTotalBucket.income[currencyID] = (monthTotalBucket.income[currencyID] or 0) + change
+            
+            -- By category (only for gold)
+            if currencyID == 0 then
+                if not weekBucket.incomeByCategory[currencyID] then
+                    weekBucket.incomeByCategory[currencyID] = {}
+                end
+                weekBucket.incomeByCategory[currencyID][cat] = (weekBucket.incomeByCategory[currencyID][cat] or 0) + change
+                
+                if not monthDayBucket.incomeByCategory[currencyID] then
+                    monthDayBucket.incomeByCategory[currencyID] = {}
+                end
+                monthDayBucket.incomeByCategory[currencyID][cat] = (monthDayBucket.incomeByCategory[currencyID][cat] or 0) + change
+                
+                if not monthTotalBucket.incomeByCategory[currencyID] then
+                    monthTotalBucket.incomeByCategory[currencyID] = {}
+                end
+                monthTotalBucket.incomeByCategory[currencyID][cat] = (monthTotalBucket.incomeByCategory[currencyID][cat] or 0) + change
             end
-            charData.dailyData[dateStr].currencies[currencyID] = charData.dailyData[dateStr].currencies[currencyID] + change
+        elseif change < 0 then
+            -- Expense (store as positive number)
+            local absChange = math.abs(change)
+            weekBucket.expense[currencyID] = (weekBucket.expense[currencyID] or 0) + absChange
+            monthDayBucket.expense[currencyID] = (monthDayBucket.expense[currencyID] or 0) + absChange
+            monthTotalBucket.expense[currencyID] = (monthTotalBucket.expense[currencyID] or 0) + absChange
+            
+            -- By category (only for gold)
+            if currencyID == 0 then
+                if not weekBucket.expenseByCategory[currencyID] then
+                    weekBucket.expenseByCategory[currencyID] = {}
+                end
+                weekBucket.expenseByCategory[currencyID][cat] = (weekBucket.expenseByCategory[currencyID][cat] or 0) + absChange
+                
+                if not monthDayBucket.expenseByCategory[currencyID] then
+                    monthDayBucket.expenseByCategory[currencyID] = {}
+                end
+                monthDayBucket.expenseByCategory[currencyID][cat] = (monthDayBucket.expenseByCategory[currencyID][cat] or 0) + absChange
+                
+                if not monthTotalBucket.expenseByCategory[currencyID] then
+                    monthTotalBucket.expenseByCategory[currencyID] = {}
+                end
+                monthTotalBucket.expenseByCategory[currencyID][cat] = (monthTotalBucket.expenseByCategory[currencyID][cat] or 0) + absChange
+            end
         end
     end
+end
+
+-- Get localized category name
+local function GetCategoryName(category)
+    local key = "CATEGORY_" .. category
+    return L[key] or category
 end
 
 -- Calculate earnings for different periods
@@ -300,8 +605,8 @@ local function CalculateEarnings(playerName)
     end
     
     local dateStr = GetDateString()
-    local weekStr = GetWeekString()
-    local monthStr = GetMonthString()
+    local dayOfWeek = GetDayOfWeek()
+    local dayOfMonth = GetDayOfMonth()
     
     local sessionCurrencies = {}
     local todayCurrencies = {}
@@ -333,36 +638,55 @@ local function CalculateEarnings(playerName)
         }
     end
     
-    -- Calculate today, week and month earnings from daily data
-    for date, data in pairs(charData.dailyData) do
-        if date == dateStr then
-            if data.currencies then
-                for currencyID, change in pairs(data.currencies) do
-                    todayCurrencies[currencyID] = (todayCurrencies[currencyID] or 0) + change
-                end
-            end
+    -- Separate income/expense tracking
+    local todayIncome = {}
+    local todayExpense = {}
+    local weekIncome = {}
+    local weekExpense = {}
+    local monthIncome = {}
+    local monthExpense = {}
+    
+    -- Calculate today from today's buckets
+    local todayWeekBucket = charData.weekDays[dayOfWeek]
+    local todayMonthBucket = charData.monthDays[dayOfMonth]
+    
+    if todayWeekBucket.date == dateStr then
+        for currencyID, income in pairs(todayWeekBucket.income) do
+            todayCurrencies[currencyID] = (todayCurrencies[currencyID] or 0) + income
+            todayIncome[currencyID] = (todayIncome[currencyID] or 0) + income
         end
-        if data.week == weekStr then
-            if data.currencies then
-                for currencyID, change in pairs(data.currencies) do
-                    weekCurrencies[currencyID] = (weekCurrencies[currencyID] or 0) + change
-                end
-            end
+        for currencyID, expense in pairs(todayWeekBucket.expense) do
+            todayCurrencies[currencyID] = (todayCurrencies[currencyID] or 0) - expense
+            todayExpense[currencyID] = (todayExpense[currencyID] or 0) + expense
         end
-        if data.month == monthStr then
-            if data.currencies then
-                for currencyID, change in pairs(data.currencies) do
-                    monthCurrencies[currencyID] = (monthCurrencies[currencyID] or 0) + change
-                end
+    end
+    
+    -- Calculate week from all week day buckets
+    for i = 1, 7 do
+        local bucket = charData.weekDays[i]
+        if bucket.date then
+            for currencyID, income in pairs(bucket.income) do
+                weekCurrencies[currencyID] = (weekCurrencies[currencyID] or 0) + income
+                weekIncome[currencyID] = (weekIncome[currencyID] or 0) + income
+            end
+            for currencyID, expense in pairs(bucket.expense) do
+                weekCurrencies[currencyID] = (weekCurrencies[currencyID] or 0) - expense
+                weekExpense[currencyID] = (weekExpense[currencyID] or 0) + expense
             end
         end
     end
     
-    -- Add current session to today/week/month
-    for currencyID, data in pairs(sessionCurrencies) do
-        todayCurrencies[currencyID] = (todayCurrencies[currencyID] or 0) + data.change
-        weekCurrencies[currencyID] = (weekCurrencies[currencyID] or 0) + data.change
-        monthCurrencies[currencyID] = (monthCurrencies[currencyID] or 0) + data.change
+    -- Calculate month from month total bucket
+    local monthTotalBucket = charData.monthTotal
+    if monthTotalBucket.month == GetMonthString() then
+        for currencyID, income in pairs(monthTotalBucket.income) do
+            monthCurrencies[currencyID] = (monthCurrencies[currencyID] or 0) + income
+            monthIncome[currencyID] = (monthIncome[currencyID] or 0) + income
+        end
+        for currencyID, expense in pairs(monthTotalBucket.expense) do
+            monthCurrencies[currencyID] = (monthCurrencies[currencyID] or 0) - expense
+            monthExpense[currencyID] = (monthExpense[currencyID] or 0) + expense
+        end
     end
     
     -- Include all current currencies
@@ -380,6 +704,8 @@ local function CalculateEarnings(playerName)
     
     -- Convert to formatted objects
     local todayCurrenciesFormatted = {}
+    local todayIncomeFormatted = {}
+    local todayExpenseFormatted = {}
     for currencyID, change in pairs(todayCurrencies) do
         local currInfo = currentCurrencies[currencyID] or charData.currencyData[currencyID]
         todayCurrenciesFormatted[currencyID] = {
@@ -388,8 +714,26 @@ local function CalculateEarnings(playerName)
             iconFileID = currInfo and currInfo.iconFileID or 134400
         }
     end
+    for currencyID, income in pairs(todayIncome) do
+        local currInfo = currentCurrencies[currencyID] or charData.currencyData[currencyID]
+        todayIncomeFormatted[currencyID] = {
+            name = currInfo and currInfo.name or ("Currency " .. currencyID),
+            change = income,
+            iconFileID = currInfo and currInfo.iconFileID or 134400
+        }
+    end
+    for currencyID, expense in pairs(todayExpense) do
+        local currInfo = currentCurrencies[currencyID] or charData.currencyData[currencyID]
+        todayExpenseFormatted[currencyID] = {
+            name = currInfo and currInfo.name or ("Currency " .. currencyID),
+            change = -expense,
+            iconFileID = currInfo and currInfo.iconFileID or 134400
+        }
+    end
     
     local weekCurrenciesFormatted = {}
+    local weekIncomeFormatted = {}
+    local weekExpenseFormatted = {}
     for currencyID, change in pairs(weekCurrencies) do
         local currInfo = currentCurrencies[currencyID] or charData.currencyData[currencyID]
         weekCurrenciesFormatted[currencyID] = {
@@ -398,8 +742,26 @@ local function CalculateEarnings(playerName)
             iconFileID = currInfo and currInfo.iconFileID or 134400
         }
     end
+    for currencyID, income in pairs(weekIncome) do
+        local currInfo = currentCurrencies[currencyID] or charData.currencyData[currencyID]
+        weekIncomeFormatted[currencyID] = {
+            name = currInfo and currInfo.name or ("Currency " .. currencyID),
+            change = income,
+            iconFileID = currInfo and currInfo.iconFileID or 134400
+        }
+    end
+    for currencyID, expense in pairs(weekExpense) do
+        local currInfo = currentCurrencies[currencyID] or charData.currencyData[currencyID]
+        weekExpenseFormatted[currencyID] = {
+            name = currInfo and currInfo.name or ("Currency " .. currencyID),
+            change = -expense,
+            iconFileID = currInfo and currInfo.iconFileID or 134400
+        }
+    end
     
     local monthCurrenciesFormatted = {}
+    local monthIncomeFormatted = {}
+    local monthExpenseFormatted = {}
     for currencyID, change in pairs(monthCurrencies) do
         local currInfo = currentCurrencies[currencyID] or charData.currencyData[currencyID]
         monthCurrenciesFormatted[currencyID] = {
@@ -408,8 +770,36 @@ local function CalculateEarnings(playerName)
             iconFileID = currInfo and currInfo.iconFileID or 134400
         }
     end
+    for currencyID, income in pairs(monthIncome) do
+        local currInfo = currentCurrencies[currencyID] or charData.currencyData[currencyID]
+        monthIncomeFormatted[currencyID] = {
+            name = currInfo and currInfo.name or ("Currency " .. currencyID),
+            change = income,
+            iconFileID = currInfo and currInfo.iconFileID or 134400
+        }
+    end
+    for currencyID, expense in pairs(monthExpense) do
+        local currInfo = currentCurrencies[currencyID] or charData.currencyData[currencyID]
+        monthExpenseFormatted[currencyID] = {
+            name = currInfo and currInfo.name or ("Currency " .. currencyID),
+            change = -expense,
+            iconFileID = currInfo and currInfo.iconFileID or 134400
+        }
+    end
     
-    return sessionCurrencies, todayCurrenciesFormatted, weekCurrenciesFormatted, monthCurrenciesFormatted, currentCurrencies
+    -- Create income-only and expense-only versions for session (calculated from balance)
+    local sessionIncome = {}
+    local sessionExpense = {}
+    for currencyID, data in pairs(sessionCurrencies) do
+        if data.change > 0 then
+            sessionIncome[currencyID] = data
+        elseif data.change < 0 then
+            sessionExpense[currencyID] = data
+        end
+    end
+    
+    return sessionCurrencies, todayCurrenciesFormatted, weekCurrenciesFormatted, monthCurrenciesFormatted, currentCurrencies,
+           sessionIncome, sessionExpense, todayIncomeFormatted, todayExpenseFormatted, weekIncomeFormatted, weekExpenseFormatted, monthIncomeFormatted, monthExpenseFormatted
 end
 
 -- Create the display frame
@@ -418,12 +808,12 @@ local function CreateDisplayFrame()
     frame:SetSize(1100, 450)
     frame:SetPoint("CENTER", UIParent, "CENTER", 0, 0)
     
-    -- Backdrop
+    -- Backdrop (Classic WoW style)
     frame:SetBackdrop({
-        bgFile = "Interface\\Tooltips\\UI-Tooltip-Background",
+        bgFile = "Interface\\DialogFrame\\UI-DialogBox-Background",
         edgeFile = "Interface\\DialogFrame\\UI-DialogBox-Border",
         tile = true,
-        tileSize = 16,
+        tileSize = 32,
         edgeSize = 32,
         insets = { left = 11, right = 12, top = 12, bottom = 11 }
     })
@@ -436,45 +826,113 @@ local function CreateDisplayFrame()
     frame:SetScript("OnDragStart", frame.StartMoving)
     frame:SetScript("OnDragStop", frame.StopMovingOrSizing)
     
-    -- Title
+    -- Title (Classic gold color)
     local title = frame:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
     title:SetPoint("TOP", 0, -15)
-    title:SetText("Gold Log")
+    title:SetTextColor(1, 0.82, 0) -- Classic WoW gold
+    title:SetText(L["ADDON_NAME"])
+    
+    -- Tab buttons (Classic WoW style)
+    local function CreateTabButton(text, tabValue, xOffset)
+        local tab = CreateFrame("Button", nil, frame, "BackdropTemplate")
+        tab:SetSize(120, 28)
+        tab:SetPoint("TOPLEFT", 20 + xOffset, -42)
+        
+        -- Classic WoW tab backdrop
+        tab:SetBackdrop({
+            bgFile = "Interface\\DialogFrame\\UI-DialogBox-Background",
+            edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
+            tile = true,
+            tileSize = 16,
+            edgeSize = 16,
+            insets = { left = 4, right = 4, top = 4, bottom = 4 }
+        })
+        tab:SetBackdropColor(0.18, 0.12, 0.06, 1)
+        tab:SetBackdropBorderColor(0.5, 0.4, 0.2, 1)
+        
+        local tabText = tab:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+        tabText:SetPoint("CENTER")
+        tabText:SetTextColor(0.9, 0.8, 0.5) -- Muted gold
+        tabText:SetText(text)
+        tab.text = tabText
+        
+        tab:SetScript("OnClick", function()
+            activeTab = tabValue
+            UpdateDisplay()
+        end)
+        
+        tab:SetScript("OnEnter", function(self)
+            if activeTab ~= tabValue then
+                self:SetBackdropColor(0.25, 0.18, 0.10, 1)
+                self.text:SetTextColor(1, 0.82, 0) -- Bright gold on hover
+            end
+        end)
+        
+        tab:SetScript("OnLeave", function(self)
+            if activeTab ~= tabValue then
+                self:SetBackdropColor(0.18, 0.12, 0.06, 1)
+                self.text:SetTextColor(0.9, 0.8, 0.5)
+            end
+        end)
+        
+        return tab
+    end
+    
+    frame.balanceTab = CreateTabButton(L["TAB_BALANCE"], "balance", 0)
+    frame.incomeTab = CreateTabButton(L["TAB_INCOME"], "income", 130)
+    frame.expenseTab = CreateTabButton(L["TAB_EXPENSE"], "expense", 260)
     
     -- Currency section separator
     local currencySeparator = frame:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-    currencySeparator:SetPoint("TOPLEFT", 20, -45)
-    currencySeparator:SetText("|cffFFD700Einnahmen:|r")
+    currencySeparator:SetPoint("TOPLEFT", 20, -75)
+    currencySeparator:SetText("|cffFFD700" .. L["CURRENCIES"] .. ":|r")
+    frame.currencySeparator = currencySeparator
     
-    -- Table headers
+    -- Table headers (Classic WoW style)
     local headerBg = frame:CreateTexture(nil, "BACKGROUND")
-    headerBg:SetPoint("TOPLEFT", 20, -63)
-    headerBg:SetSize(1050, 20)
-    headerBg:SetColorTexture(0.1, 0.1, 0.1, 0.8)
+    headerBg:SetPoint("TOPLEFT", 20, -93)
+    headerBg:SetSize(1050, 22)
+    headerBg:SetColorTexture(HEADER_BG_COLOR_R, HEADER_BG_COLOR_G, HEADER_BG_COLOR_B, HEADER_BG_ALPHA)
+    
+    -- Header border
+    local headerBorder = frame:CreateTexture(nil, "BORDER")
+    headerBorder:SetPoint("TOPLEFT", 20, -93)
+    headerBorder:SetSize(1050, 1)
+    headerBorder:SetColorTexture(0.5, 0.4, 0.2, 1)
+    
+    local headerBorderBottom = frame:CreateTexture(nil, "BORDER")
+    headerBorderBottom:SetPoint("TOPLEFT", 20, -115)
+    headerBorderBottom:SetSize(1050, 1)
+    headerBorderBottom:SetColorTexture(0.5, 0.4, 0.2, 1)
     
     local nameHeader = frame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-    nameHeader:SetPoint("TOPLEFT", 25, -65)
-    nameHeader:SetText("|cffFFFFFFName|r")
+    nameHeader:SetPoint("TOPLEFT", 25, -96)
+    nameHeader:SetTextColor(1, 0.82, 0) -- Gold
+    nameHeader:SetText(L["HEADER_NAME"])
     
     local sessionHeader = frame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-    sessionHeader:SetPoint("TOPLEFT", 520, -65)
-    sessionHeader:SetText("|cffFFFFFFSession|r")
+    sessionHeader:SetPoint("TOPLEFT", 520, -96)
+    sessionHeader:SetTextColor(1, 0.82, 0)
+    sessionHeader:SetText(L["HEADER_SESSION"])
     
     local todayHeader = frame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-    todayHeader:SetPoint("TOPLEFT", 700, -65)
-    todayHeader:SetText("|cffFFFFFFHeute|r")
+    todayHeader:SetPoint("TOPLEFT", 700, -96)
+    todayHeader:SetTextColor(1, 0.82, 0)
+    todayHeader:SetText(L["HEADER_TODAY"])
     
     local weekHeader = frame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-    weekHeader:SetPoint("TOPLEFT", 860, -65)
-    weekHeader:SetText("|cffFFFFFFWoche|r")
+    weekHeader:SetPoint("TOPLEFT", 860, -96)
+    weekHeader:SetTextColor(1, 0.82, 0)
+    weekHeader:SetText(L["HEADER_WEEK"])
     
     local monthHeader = frame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-    monthHeader:SetPoint("TOPLEFT", 1000, -65)
-    monthHeader:SetText("|cffFFFFFFMonat|r")
+    monthHeader:SetPoint("TOPLEFT", 1000, -96)
+    monthHeader:SetTextColor(1, 0.82, 0)
+    monthHeader:SetText(L["HEADER_MONTH"])
     
     -- Currency scroll frame
     local scrollFrame = CreateFrame("ScrollFrame", nil, frame, "UIPanelScrollFrameTemplate")
-    scrollFrame:SetPoint("TOPLEFT", 20, -85)
+    scrollFrame:SetPoint("TOPLEFT", 20, -118)
     scrollFrame:SetPoint("BOTTOMRIGHT", -30, 15)
     
     local scrollChild = CreateFrame("Frame", nil, scrollFrame)
@@ -500,13 +958,81 @@ local function CreateDisplayFrame()
 end
 
 -- Update display
-local function UpdateDisplay()
+UpdateDisplay = function()
     if not frame or not frame:IsVisible() then
         return
     end
     
+    -- Update tab button appearance (Classic WoW style)
+    if frame.balanceTab then
+        if activeTab == "balance" then
+            frame.balanceTab:SetBackdropColor(0.35, 0.25, 0.12, 1)
+            frame.balanceTab:SetBackdropBorderColor(1, 0.82, 0, 1) -- Gold border
+            frame.balanceTab.text:SetTextColor(1, 0.82, 0) -- Bright gold
+        else
+            frame.balanceTab:SetBackdropColor(0.18, 0.12, 0.06, 1)
+            frame.balanceTab:SetBackdropBorderColor(0.5, 0.4, 0.2, 1)
+            frame.balanceTab.text:SetTextColor(0.9, 0.8, 0.5)
+        end
+    end
+    
+    if frame.incomeTab then
+        if activeTab == "income" then
+            frame.incomeTab:SetBackdropColor(0.35, 0.25, 0.12, 1)
+            frame.incomeTab:SetBackdropBorderColor(1, 0.82, 0, 1)
+            frame.incomeTab.text:SetTextColor(1, 0.82, 0)
+        else
+            frame.incomeTab:SetBackdropColor(0.18, 0.12, 0.06, 1)
+            frame.incomeTab:SetBackdropBorderColor(0.5, 0.4, 0.2, 1)
+            frame.incomeTab.text:SetTextColor(0.9, 0.8, 0.5)
+        end
+    end
+    
+    if frame.expenseTab then
+        if activeTab == "expense" then
+            frame.expenseTab:SetBackdropColor(0.35, 0.25, 0.12, 1)
+            frame.expenseTab:SetBackdropBorderColor(1, 0.82, 0, 1)
+            frame.expenseTab.text:SetTextColor(1, 0.82, 0)
+        else
+            frame.expenseTab:SetBackdropColor(0.18, 0.12, 0.06, 1)
+            frame.expenseTab:SetBackdropBorderColor(0.5, 0.4, 0.2, 1)
+            frame.expenseTab.text:SetTextColor(0.9, 0.8, 0.5)
+        end
+    end
+    
+    -- Update separator text based on active tab
+    if frame.currencySeparator then
+        if activeTab == "balance" then
+            frame.currencySeparator:SetText("|cffFFD700" .. L["CURRENCIES_BALANCE"] .. ":|r")
+        elseif activeTab == "income" then
+            frame.currencySeparator:SetText("|cff00FF00" .. L["CURRENCIES_INCOME"] .. ":|r")
+        elseif activeTab == "expense" then
+            frame.currencySeparator:SetText("|cffFF0000" .. L["CURRENCIES_EXPENSE"] .. ":|r")
+        end
+    end
+    
     local playerName = UnitName("player") .. "-" .. GetRealmName()
-    local sessionCurrencies, todayCurrencies, weekCurrencies, monthCurrencies, currentCurrencies = CalculateEarnings(playerName)
+    local sessionCurrencies, todayCurrencies, weekCurrencies, monthCurrencies, currentCurrencies,
+          sessionIncome, sessionExpense, todayIncome, todayExpense, weekIncome, weekExpense, monthIncome, monthExpense = CalculateEarnings(playerName)
+    
+    -- Select the correct data set based on active tab
+    local displaySession, displayToday, displayWeek, displayMonth
+    if activeTab == "income" then
+        displaySession = sessionIncome
+        displayToday = todayIncome
+        displayWeek = weekIncome
+        displayMonth = monthIncome
+    elseif activeTab == "expense" then
+        displaySession = sessionExpense
+        displayToday = todayExpense
+        displayWeek = weekExpense
+        displayMonth = monthExpense
+    else -- balance
+        displaySession = sessionCurrencies
+        displayToday = todayCurrencies
+        displayWeek = weekCurrencies
+        displayMonth = monthCurrencies
+    end
     
     -- Update currency display
     -- Clear existing lines and buttons
@@ -520,7 +1046,7 @@ local function UpdateDisplay()
     local lineNum = 1
     
     -- Group currencies by expansion (Gold will be in its own group at the top)
-    local groupedCurrencies = GroupCurrenciesByExpansion(todayCurrencies)
+    local groupedCurrencies = GroupCurrenciesByExpansion(displayToday)
     
     -- Expansion display order (Gold first)
     local expansionOrder = {
@@ -541,22 +1067,22 @@ local function UpdateDisplay()
         local allExpCurrencies = {}
         
         -- Collect unique currency IDs from all periods
-        for currencyID, data in pairs(sessionCurrencies) do
+        for currencyID, data in pairs(displaySession) do
             if GetCurrencyExpansion(currencyID) == expansion then
                 allExpCurrencies[currencyID] = true
             end
         end
-        for currencyID, data in pairs(todayCurrencies) do
+        for currencyID, data in pairs(displayToday) do
             if GetCurrencyExpansion(currencyID) == expansion then
                 allExpCurrencies[currencyID] = true
             end
         end
-        for currencyID, data in pairs(weekCurrencies) do
+        for currencyID, data in pairs(displayWeek) do
             if GetCurrencyExpansion(currencyID) == expansion then
                 allExpCurrencies[currencyID] = true
             end
         end
-        for currencyID, data in pairs(monthCurrencies) do
+        for currencyID, data in pairs(displayMonth) do
             if GetCurrencyExpansion(currencyID) == expansion then
                 allExpCurrencies[currencyID] = true
             end
@@ -570,7 +1096,7 @@ local function UpdateDisplay()
         
         if hasAny then
             -- Create or reuse header button
-            if not frame.currencyLines[lineNum] or not frame.currencyLines[lineNum].SetText then
+            if not frame.currencyLines[lineNum] or not frame.currencyLines[lineNum].text then
                 local headerBtn = CreateFrame("Button", nil, frame.currencyScrollChild)
                 headerBtn:SetSize(1050, 20)
                 
@@ -623,18 +1149,18 @@ local function UpdateDisplay()
                 -- Sort currencies by biggest change
                 local sortedCurrencies = {}
                 for currencyID in pairs(allExpCurrencies) do
-                    local sessionData = sessionCurrencies[currencyID]
-                    local todayData = todayCurrencies[currencyID]
+                    local sessionData = displaySession[currencyID]
+                    local todayData = displayToday[currencyID]
                     
                     -- Calculate total change magnitude for sorting
                     local maxChange = 0
                     if sessionData then maxChange = math.max(maxChange, math.abs(sessionData.change)) end
                     if todayData then maxChange = math.max(maxChange, math.abs(todayData.change)) end
-                    if weekCurrencies[currencyID] and weekCurrencies[currencyID].change then 
-                        maxChange = math.max(maxChange, math.abs(weekCurrencies[currencyID].change)) 
+                    if displayWeek[currencyID] and displayWeek[currencyID].change then 
+                        maxChange = math.max(maxChange, math.abs(displayWeek[currencyID].change)) 
                     end
-                    if monthCurrencies[currencyID] and monthCurrencies[currencyID].change then 
-                        maxChange = math.max(maxChange, math.abs(monthCurrencies[currencyID].change)) 
+                    if displayMonth[currencyID] and displayMonth[currencyID].change then 
+                        maxChange = math.max(maxChange, math.abs(displayMonth[currencyID].change)) 
                     end
                     
                     local name = (sessionData and sessionData.name) or (todayData and todayData.name) or ("Currency " .. currencyID)
@@ -659,7 +1185,7 @@ local function UpdateDisplay()
                     local currencyID = currEntry.id
                     
                     -- Create row frame if needed
-                    if not frame.currencyLines[lineNum] or frame.currencyLines[lineNum].SetText then
+                    if not frame.currencyLines[lineNum] or not frame.currencyLines[lineNum].nameText then
                         local rowFrame = CreateFrame("Frame", nil, frame.currencyScrollChild)
                         rowFrame:SetSize(1050, 18)
                         
@@ -735,19 +1261,19 @@ local function UpdateDisplay()
                     end
                     
                     -- Session
-                    local sessionVal = sessionCurrencies[currencyID] and sessionCurrencies[currencyID].change or 0
+                    local sessionVal = displaySession[currencyID] and displaySession[currencyID].change or 0
                     rowFrame.sessionText:SetText(FormatCurrencyValue(sessionVal, currencyID))
                     
                     -- Today
-                    local todayVal = todayCurrencies[currencyID] and todayCurrencies[currencyID].change or 0
+                    local todayVal = displayToday[currencyID] and displayToday[currencyID].change or 0
                     rowFrame.todayText:SetText(FormatCurrencyValue(todayVal, currencyID))
                     
                     -- Week
-                    local weekVal = weekCurrencies[currencyID] and weekCurrencies[currencyID].change or 0
+                    local weekVal = displayWeek[currencyID] and displayWeek[currencyID].change or 0
                     rowFrame.weekText:SetText(FormatCurrencyValue(weekVal, currencyID))
                     
                     -- Month
-                    local monthVal = monthCurrencies[currencyID] and monthCurrencies[currencyID].change or 0
+                    local monthVal = displayMonth[currencyID] and displayMonth[currencyID].change or 0
                     rowFrame.monthText:SetText(FormatCurrencyValue(monthVal, currencyID))
                     
                     rowFrame:Show()
@@ -785,40 +1311,42 @@ end
 -- Create LibDataBroker object
 local function CreateDataBroker()
     if not LDB then
-        print("|cffff0000GoldLog:|r LibDataBroker nicht gefunden. Installiere Bazooka oder ein anderes LDB-Display-Addon.")
+        print("|cffff0000GoldLog:|r " .. L["LDB_NOT_FOUND"])
         return
     end
     
     dataObject = LDB:NewDataObject("GoldLog", {
         type = "data source",
-        text = "Gold Log",
+        text = L["ADDON_NAME"],
         icon = "Interface\\Icons\\INV_Misc_Coin_01",
-        label = "Gold Log",
+        label = L["ADDON_NAME"],
         
         OnClick = function(clickedframe, button)
             if button == "LeftButton" then
                 ToggleFrame()
             elseif button == "RightButton" then
-                -- Reset all data
+                -- Reset session only
                 local playerName = UnitName("player") .. "-" .. GetRealmName()
                 if GoldLogDB.characters and GoldLogDB.characters[playerName] then
-                    GoldLogDB.characters[playerName].dailyData = {}
-                    GoldLogDB.characters[playerName].currencies = {}
-                    GoldLogDB.characters[playerName].currencyData = {}
+                    -- Reset session start to current values
+                    local currentCurrencies = GetAllCurrencies()
                     sessionStartCurrencies = {}
-                    print("|cff00ff00GoldLog:|r Alle Daten zurückgesetzt!")
+                    for currencyID, data in pairs(currentCurrencies) do
+                        sessionStartCurrencies[currencyID] = data.quantity
+                    end
+                    print("|cff00ff00GoldLog:|r " .. L["SESSION_RESET"])
                     UpdateDisplay()
                 end
             end
         end,
         
         OnTooltipShow = function(tooltip)
-            tooltip:SetText("|cff00ff00Gold Log|r", 1, 1, 1)
+            tooltip:SetText("|cff00ff00" .. L["ADDON_NAME"] .. "|r", 1, 1, 1)
             tooltip:AddLine(" ")
             
             local playerName = UnitName("player") .. "-" .. GetRealmName()
             if not GoldLogDB.characters or not GoldLogDB.characters[playerName] then
-                tooltip:AddLine("Keine Daten verfügbar")
+                tooltip:AddLine(L["NO_DATA"])
                 tooltip:Show()
                 return
             end
@@ -833,22 +1361,22 @@ local function CreateDataBroker()
             
             if goldSession then
                 local sessionColor = goldSession.change >= 0 and "|cff00ff00" or "|cffff0000"
-                tooltip:AddDoubleLine("Session:", sessionColor .. FormatGold(goldSession.change) .. "|r")
+                tooltip:AddDoubleLine(L["SESSION"] .. ":", sessionColor .. FormatGold(goldSession.change) .. "|r")
             end
             
             if goldToday then
                 local todayColor = goldToday.change >= 0 and "|cff00ff00" or "|cffff0000"
-                tooltip:AddDoubleLine("Heute:", todayColor .. FormatGold(goldToday.change) .. "|r")
+                tooltip:AddDoubleLine(L["TODAY"] .. ":", todayColor .. FormatGold(goldToday.change) .. "|r")
             end
             
             if goldWeek then
                 local weekColor = goldWeek.change >= 0 and "|cff00ff00" or "|cffff0000"
-                tooltip:AddDoubleLine("Diese Woche:", weekColor .. FormatGold(goldWeek.change) .. "|r")
+                tooltip:AddDoubleLine(L["THIS_WEEK"] .. ":", weekColor .. FormatGold(goldWeek.change) .. "|r")
             end
             
             if goldMonth then
                 local monthColor = goldMonth.change >= 0 and "|cff00ff00" or "|cffff0000"
-                tooltip:AddDoubleLine("Dieser Monat:", monthColor .. FormatGold(goldMonth.change) .. "|r")
+                tooltip:AddDoubleLine(L["THIS_MONTH"] .. ":", monthColor .. FormatGold(goldMonth.change) .. "|r")
             end
             
             -- Top 5 currencies with changes (excluding Gold)
@@ -862,7 +1390,7 @@ local function CreateDataBroker()
             
             if #sortedCurrencies > 0 then
                 tooltip:AddLine(" ")
-                tooltip:AddLine("|cffFFD700Währungen:|r")
+                tooltip:AddLine("|cffFFD700" .. L["CURRENCIES"] .. ":|r")
                 for i = 1, math.min(5, #sortedCurrencies) do
                     local data = sortedCurrencies[i]
                     local color = data.change >= 0 and "|cff00ff00" or "|cffff0000"
@@ -870,13 +1398,13 @@ local function CreateDataBroker()
                     tooltip:AddDoubleLine(data.name, color .. changeText .. "|r")
                 end
                 if #sortedCurrencies > 5 then
-                    tooltip:AddLine("|cff888888... und " .. (#sortedCurrencies - 5) .. " weitere|r")
+                    tooltip:AddLine(string.format("|cff888888" .. L["AND_MORE"] .. "|r", #sortedCurrencies - 5))
                 end
             end
             
             tooltip:AddLine(" ")
-            tooltip:AddLine("|cffFFFFFFLinksklick:|r Fenster öffnen", 0.8, 0.8, 0.8)
-            tooltip:AddLine("|cffFFFFFFRechtsklick:|r Alle Daten zurücksetzen", 0.8, 0.8, 0.8)
+            tooltip:AddLine("|cffFFFFFF" .. L["TOOLTIP_LEFT_CLICK"] .. ":|r " .. L["TOOLTIP_OPEN_WINDOW"], 0.8, 0.8, 0.8)
+            tooltip:AddLine("|cffFFFFFF" .. L["TOOLTIP_RIGHT_CLICK"] .. ":|r " .. L["TOOLTIP_RESET_DATA"], 0.8, 0.8, 0.8)
             
             tooltip:Show()
         end,
@@ -889,7 +1417,7 @@ local function UpdateDataBrokerText()
     
     local playerName = UnitName("player") .. "-" .. GetRealmName()
     if not GoldLogDB.characters or not GoldLogDB.characters[playerName] then
-        dataObject.text = "Gold Log"
+        dataObject.text = L["ADDON_NAME"]
         return
     end
     
@@ -897,9 +1425,9 @@ local function UpdateDataBrokerText()
     local goldData = sessionCurrencies[0]
     if goldData then
         local color = goldData.change >= 0 and "|cff00ff00" or "|cffff0000"
-        dataObject.text = "Gold: " .. color .. FormatGold(goldData.change) .. "|r"
+        dataObject.text = L["GOLD"] .. ": " .. color .. FormatGold(goldData.change) .. "|r"
     else
-        dataObject.text = "Gold Log"
+        dataObject.text = L["ADDON_NAME"]
     end
 end
 
@@ -911,15 +1439,32 @@ eventFrame:RegisterEvent("PLAYER_MONEY")
 eventFrame:RegisterEvent("CURRENCY_DISPLAY_UPDATE")
 eventFrame:RegisterEvent("PLAYER_LOGOUT")
 
+-- Transaction context events
+eventFrame:RegisterEvent("MERCHANT_SHOW")
+eventFrame:RegisterEvent("MERCHANT_CLOSED")
+eventFrame:RegisterEvent("MAIL_SHOW")
+eventFrame:RegisterEvent("MAIL_CLOSED")
+eventFrame:RegisterEvent("MAIL_SEND_SUCCESS")
+eventFrame:RegisterEvent("TRADE_SHOW")
+eventFrame:RegisterEvent("TRADE_CLOSED")
+eventFrame:RegisterEvent("QUEST_TURNED_IN")
+eventFrame:RegisterEvent("QUEST_COMPLETE")
+eventFrame:RegisterEvent("LOOT_OPENED")
+eventFrame:RegisterEvent("LOOT_CLOSED")
+eventFrame:RegisterEvent("AUCTION_HOUSE_SHOW")
+eventFrame:RegisterEvent("AUCTION_HOUSE_CLOSED")
+eventFrame:RegisterEvent("GUILDBANKFRAME_OPENED")
+eventFrame:RegisterEvent("GUILDBANKFRAME_CLOSED")
+
 eventFrame:SetScript("OnEvent", function(self, event, arg1)
     if event == "ADDON_LOADED" and arg1 == ADDON_NAME then
         -- Initialize database
         local playerName = InitializeDB()
         -- Create DataBroker object
         CreateDataBroker()
-        print("|cff00ff00GoldLog|r geladen. Benutze /goldlog oder /gl zum Anzeigen.")
+        print("|cff00ff00GoldLog|r " .. L["LOADED"])
         if LDB then
-            print("|cff00ff00GoldLog:|r LibDataBroker gefunden - Bazooka-Integration aktiv.")
+            print("|cff00ff00GoldLog:|r " .. L["LDB_FOUND"])
         end
         
     elseif event == "PLAYER_ENTERING_WORLD" then
@@ -1000,7 +1545,7 @@ eventFrame:SetScript("OnEvent", function(self, event, arg1)
         end
         
         if hasChanges then
-            UpdateDailyData(playerName, currencyChanges)
+            UpdateBucketData(playerName, currencyChanges)
             UpdateDataBrokerText()
         end
         
@@ -1009,6 +1554,36 @@ eventFrame:SetScript("OnEvent", function(self, event, arg1)
     elseif event == "PLAYER_LOGOUT" then
         -- All currency values are already saved in charData.currencies
         -- No additional action needed
+        
+    -- Transaction context events
+    elseif event == "MERCHANT_SHOW" then
+        SetTransactionContext("MERCHANT")
+    elseif event == "MERCHANT_CLOSED" then
+        ClearTransactionContext()
+    elseif event == "MAIL_SHOW" then
+        SetTransactionContext("MAIL")
+    elseif event == "MAIL_CLOSED" then
+        ClearTransactionContext()
+    elseif event == "MAIL_SEND_SUCCESS" then
+        SetTransactionContext("MAIL")
+    elseif event == "TRADE_SHOW" then
+        SetTransactionContext("TRADE")
+    elseif event == "TRADE_CLOSED" then
+        ClearTransactionContext()
+    elseif event == "QUEST_TURNED_IN" or event == "QUEST_COMPLETE" then
+        SetTransactionContext("QUEST")
+    elseif event == "LOOT_OPENED" then
+        SetTransactionContext("LOOT")
+    elseif event == "LOOT_CLOSED" then
+        ClearTransactionContext()
+    elseif event == "AUCTION_HOUSE_SHOW" then
+        SetTransactionContext("AUCTION")
+    elseif event == "AUCTION_HOUSE_CLOSED" then
+        ClearTransactionContext()
+    elseif event == "GUILDBANKFRAME_OPENED" then
+        SetTransactionContext("GUILD_BANK")
+    elseif event == "GUILDBANKFRAME_CLOSED" then
+        ClearTransactionContext()
     end
 end)
 
@@ -1020,33 +1595,50 @@ SlashCmdList["GOLDLOG"] = function(msg)
     
     if msg == "reset" then
         local playerName = UnitName("player") .. "-" .. GetRealmName()
-        GoldLogDB.characters[playerName].dailyData = {}
+        -- Reset all buckets
+        for i = 1, 7 do
+            GoldLogDB.characters[playerName].weekDays[i] = {
+                date = nil,
+                income = {},
+                expense = {}
+            }
+        end
+        for i = 1, 31 do
+            GoldLogDB.characters[playerName].monthDays[i] = {
+                date = nil,
+                income = {},
+                expense = {}
+            }
+        end
+        GoldLogDB.characters[playerName].monthTotal = {
+            month = nil,
+            income = {},
+            expense = {}
+        }
         GoldLogDB.characters[playerName].currencies = {}
         GoldLogDB.characters[playerName].currencyData = {}
         sessionStartCurrencies = {}
-        print("|cff00ff00GoldLog:|r Daten zurückgesetzt.")
-        UpdateDisplay()
-        print("|cff00ff00GoldLog:|r Daten zurückgesetzt.")
+        print("|cff00ff00GoldLog:|r " .. L["RESET_CONFIRM"])
         UpdateDisplay()
     elseif msg == "reload" or msg == "fix" then
         -- Manually create data broker if missing
         if not dataObject and LDB then
             CreateDataBroker()
-            print("|cff00ff00GoldLog:|r DataBroker erstellt.")
+            print("|cff00ff00GoldLog:|r " .. L["DB_CREATED"])
         elseif not LDB then
-            print("|cffff0000GoldLog:|r LibDataBroker nicht verfügbar.")
+            print("|cffff0000GoldLog:|r " .. L["DB_NOT_AVAILABLE"])
         else
-            print("|cff00ff00GoldLog:|r DataBroker existiert bereits.")
+            print("|cff00ff00GoldLog:|r " .. L["DB_EXISTS"])
         end
         -- Ensure frame exists
         if not frame then
             CreateDisplayFrame()
-            print("|cff00ff00GoldLog:|r Hauptfenster erstellt.")
+            print("|cff00ff00GoldLog:|r " .. L["FRAME_CREATED"])
         end
     elseif msg == "status" or msg == "debug" or msg == "info" then
-        print("|cff00ff00=== GoldLog Status ===|r")
-        print("Version: 1.0.0")
-        print("Spieler: " .. UnitName("player") .. "-" .. GetRealmName())
+        print("|cff00ff00" .. L["STATUS_TITLE"] .. "|r")
+        print(L["VERSION"] .. ": 1.0.0")
+        print(L["PLAYER"] .. ": " .. UnitName("player") .. "-" .. GetRealmName())
         
         local playerName = UnitName("player") .. "-" .. GetRealmName()
         local sessionCurrencies, todayCurrencies, weekCurrencies, monthCurrencies, currentCurrencies = CalculateEarnings(playerName)
@@ -1057,18 +1649,18 @@ SlashCmdList["GOLDLOG"] = function(msg)
         local goldWeek = weekCurrencies[0]
         local goldMonth = monthCurrencies[0]
         
-        print("Aktuelles Gold: " .. FormatGold(GetMoney()))
+        print(L["CURRENT_GOLD"] .. ": " .. FormatGold(GetMoney()))
         if goldSession then
-            print("|cff00ff00Session:|r " .. FormatGold(goldSession.change))
+            print("|cff00ff00" .. L["SESSION"] .. ":|r " .. FormatGold(goldSession.change))
         end
         if goldToday then
-            print("|cff00ff00Heute:|r " .. FormatGold(goldToday.change))
+            print("|cff00ff00" .. L["TODAY"] .. ":|r " .. FormatGold(goldToday.change))
         end
         if goldWeek then
-            print("|cff00ff00Diese Woche:|r " .. FormatGold(goldWeek.change))
+            print("|cff00ff00" .. L["THIS_WEEK"] .. ":|r " .. FormatGold(goldWeek.change))
         end
         if goldMonth then
-            print("|cff00ff00Dieser Monat:|r " .. FormatGold(goldMonth.change))
+            print("|cff00ff00" .. L["THIS_MONTH"] .. ":|r " .. FormatGold(goldMonth.change))
         end
         
         -- Show currency counts
@@ -1081,18 +1673,18 @@ SlashCmdList["GOLDLOG"] = function(msg)
             if currencyID ~= 0 then todayCount = todayCount + 1 end
         end
         
-        print("|cff00ff00Währungen (Session):|r " .. sessionCount)
-        print("|cff00ff00Währungen (Heute):|r " .. todayCount)
+        print("|cff00ff00" .. L["CURRENCIES_SESSION"] .. ":|r " .. sessionCount)
+        print("|cff00ff00" .. L["CURRENCIES_TODAY"] .. ":|r " .. todayCount)
         
         -- Show all current currencies
         local currCount = 0
         for currencyID in pairs(currentCurrencies) do 
             if currencyID ~= 0 then currCount = currCount + 1 end
         end
-        print("|cff00ff00Aktuell besessene Währungen:|r " .. currCount)
+        print("|cff00ff00" .. L["CURRENCIES_OWNED"] .. ":|r " .. currCount)
         
         if currCount > 0 then
-            print("|cff888888Liste:|r")
+            print("|cff888888" .. L["LIST"] .. ":|r")
             for currencyID, data in pairs(currentCurrencies) do
                 if currencyID ~= 0 then
                     print("  - " .. data.name .. ": " .. data.quantity)
@@ -1101,38 +1693,49 @@ SlashCmdList["GOLDLOG"] = function(msg)
         end
         
         if LDB then
-            print("|cff00ff00LibDataBroker:|r Gefunden")
+            print("|cff00ff00LibDataBroker:|r " .. L["FOUND"])
             if dataObject then
-                print("|cff00ff00DataBroker Plugin:|r Aktiv")
+                print("|cff00ff00DataBroker Plugin:|r " .. L["ACTIVE"])
             else
-                print("|cffff0000DataBroker Plugin:|r Nicht erstellt!")
+                print("|cffff0000DataBroker Plugin:|r " .. L["NOT_CREATED"])
             end
         else
-            print("|cffff0000LibDataBroker:|r Nicht gefunden - Bazooka installieren!")
+            print("|cffff0000LibDataBroker:|r " .. L["LDB_NOT_FOUND"])
         end
         
         if frame then
-            print("|cff00ff00Hauptfenster:|r " .. (frame:IsVisible() and "Sichtbar" or "Versteckt"))
+            print("|cff00ff00" .. L["MAIN_WINDOW"] .. ":|r " .. (frame:IsVisible() and L["VISIBLE"] or L["HIDDEN"]))
         else
-            print("|cffff0000Hauptfenster:|r Nicht erstellt!")
+            print("|cffff0000" .. L["MAIN_WINDOW"] .. ":|r " .. L["NOT_CREATED"])
         end
         
         local charData = GoldLogDB.characters[playerName]
         if charData then
-            local dayCount = 0
-            for _ in pairs(charData.dailyData) do
-                dayCount = dayCount + 1
+            -- Count active buckets
+            local weekBucketCount = 0
+            for i = 1, 7 do
+                if charData.weekDays[i].date then
+                    weekBucketCount = weekBucketCount + 1
+                end
             end
-            print("Gespeicherte Tage: " .. dayCount)
+            local monthBucketCount = 0
+            for i = 1, 31 do
+                if charData.monthDays[i].date then
+                    monthBucketCount = monthBucketCount + 1
+                end
+            end
+            print("|cff00ff00" .. L["ACTIVE_WEEKDAY_BUCKETS"] .. ":|r " .. weekBucketCount .. "/7")
+            print("|cff00ff00" .. L["ACTIVE_MONTHDAY_BUCKETS"] .. ":|r " .. monthBucketCount .. "/31")
+            print("|cff00ff00" .. L["MONTH_TOTAL"] .. ":|r " .. (charData.monthTotal.month or L["NOT_INITIALIZED"]))
         end
         
     elseif msg == "help" then
-        print("|cff00ff00GoldLog Befehle:|r")
-        print("/goldlog oder /gl - Zeigt/versteckt das Gold-Fenster")
-        print("/goldlog status - Zeigt Addon-Status und aktuelle Statistiken")
-        print("/goldlog reload - Erstellt Minimap-Button und Fenster neu")
-        print("/goldlog reset - Setzt alle Daten zurück")
-        print("/goldlog help - Zeigt diese Hilfe")
+        print("|cff00ff00" .. L["HELP_TITLE"] .. ":|r")
+        print(L["HELP_TOGGLE"])
+        print(L["HELP_STATUS"])
+        print(L["HELP_RELOAD"])
+        print(L["HELP_RESET"])
+        print(L["HELP_HELP"])
     else
         ToggleFrame()
     end
