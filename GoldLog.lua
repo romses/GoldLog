@@ -3,7 +3,7 @@ local ADDON_NAME = "GoldLog"
 local GoldLog = {}
 
 -- Get localization table
-local L = LibStub("AceLocale-3.0"):GetLocale(ADDON_NAME)
+local L = LibStub("AceLocale-3.0"):GetLocale(ADDON_NAME, true) or {}
 
 -- LibDataBroker support
 local LDB = LibStub and LibStub:GetLibrary("LibDataBroker-1.1", true)
@@ -360,7 +360,9 @@ local function InitializeDB()
             monthTotal = {},    -- Monatstotal
             currencies = {},    -- Aktuelle Währungsstände
             currencyData = {},  -- Währungsinformationen (Name, Icon)
-            transactions = {}   -- Transaction history (limited to last 1000)
+            transactions = {},  -- Transaction history (limited to last 1000)
+            sessionStart = {},  -- Session start currencies (persistent across reloads)
+            sessionStartTime = 0 -- Session start timestamp
         }
         
         -- Initialize buckets
@@ -597,9 +599,8 @@ local function GetCategoryName(category)
     return L[key] or category
 end
 
--- Calculate earnings for different periods
-local function CalculateEarnings(playerName)
-    local charData = GoldLogDB.characters[playerName]
+-- Calculate earnings for a single character
+local function CalculateEarningsForCharacter(charData, playerName)
     if not charData then
         return {}, {}, {}, {}, {}
     end
@@ -613,24 +614,21 @@ local function CalculateEarnings(playerName)
     local weekCurrencies = {}
     local monthCurrencies = {}
     
-    -- Get all current currencies (including Gold as ID 0)
-    local currentCurrencies = GetAllCurrencies()
-    
-    -- Initialize sessionStartCurrencies if empty (happens on first call after login)
-    local needsInit = true
-    for _ in pairs(sessionStartCurrencies) do
-        needsInit = false
-        break
+    -- Get all current currencies (including Gold as ID 0) - only for current player
+    local currentCurrencies = {}
+    local currentPlayer = UnitName("player") .. "-" .. GetRealmName()
+    if playerName == currentPlayer then
+        currentCurrencies = GetAllCurrencies()
     end
-    if needsInit then
-        for currencyID, data in pairs(currentCurrencies) do
-            sessionStartCurrencies[currencyID] = data.quantity
-        end
+    
+    -- Load session start from saved data (persistent across reloads)
+    if not charData.sessionStart then
+        charData.sessionStart = {}
     end
     
     -- Calculate session earnings for all currencies (including Gold)
     for currencyID, data in pairs(currentCurrencies) do
-        local startAmount = sessionStartCurrencies[currencyID] or 0
+        local startAmount = charData.sessionStart[currencyID] or data.quantity
         sessionCurrencies[currencyID] = {
             name = data.name,
             change = data.quantity - startAmount,
@@ -646,32 +644,36 @@ local function CalculateEarnings(playerName)
     local monthIncome = {}
     local monthExpense = {}
     
-    -- Calculate today from today's buckets
-    local todayWeekBucket = charData.weekDays[dayOfWeek]
+    -- Calculate today from today's month day bucket (more accurate than week bucket)
     local todayMonthBucket = charData.monthDays[dayOfMonth]
     
-    if todayWeekBucket.date == dateStr then
-        for currencyID, income in pairs(todayWeekBucket.income) do
+    if todayMonthBucket.date == dateStr then
+        for currencyID, income in pairs(todayMonthBucket.income) do
             todayCurrencies[currencyID] = (todayCurrencies[currencyID] or 0) + income
             todayIncome[currencyID] = (todayIncome[currencyID] or 0) + income
         end
-        for currencyID, expense in pairs(todayWeekBucket.expense) do
+        for currencyID, expense in pairs(todayMonthBucket.expense) do
             todayCurrencies[currencyID] = (todayCurrencies[currencyID] or 0) - expense
             todayExpense[currencyID] = (todayExpense[currencyID] or 0) + expense
         end
     end
     
-    -- Calculate week from all week day buckets
+    -- Calculate week from all week day buckets (only include days from this month to avoid old data)
+    local currentMonth = GetMonthString()
     for i = 1, 7 do
         local bucket = charData.weekDays[i]
         if bucket.date then
-            for currencyID, income in pairs(bucket.income) do
-                weekCurrencies[currencyID] = (weekCurrencies[currencyID] or 0) + income
-                weekIncome[currencyID] = (weekIncome[currencyID] or 0) + income
-            end
-            for currencyID, expense in pairs(bucket.expense) do
-                weekCurrencies[currencyID] = (weekCurrencies[currencyID] or 0) - expense
-                weekExpense[currencyID] = (weekExpense[currencyID] or 0) + expense
+            -- Parse month from date (format: YYYY-MM-DD)
+            local bucketMonth = bucket.date:sub(1, 7) -- Extract YYYY-MM
+            if bucketMonth == currentMonth then
+                for currencyID, income in pairs(bucket.income) do
+                    weekCurrencies[currencyID] = (weekCurrencies[currencyID] or 0) + income
+                    weekIncome[currencyID] = (weekIncome[currencyID] or 0) + income
+                end
+                for currencyID, expense in pairs(bucket.expense) do
+                    weekCurrencies[currencyID] = (weekCurrencies[currencyID] or 0) - expense
+                    weekExpense[currencyID] = (weekExpense[currencyID] or 0) + expense
+                end
             end
         end
     end
@@ -702,12 +704,32 @@ local function CalculateEarnings(playerName)
         end
     end
     
+    -- Helper function to get currency info with fallback
+    local function GetCurrencyInfoWithFallback(currencyID)
+        local currInfo = currentCurrencies[currencyID] or charData.currencyData[currencyID]
+        
+        -- If not found in cached data, try to get it from game API
+        if not currInfo and currencyID ~= 0 then
+            local apiInfo = C_CurrencyInfo.GetCurrencyInfo(currencyID)
+            if apiInfo and apiInfo.name then
+                currInfo = {
+                    name = apiInfo.name,
+                    iconFileID = apiInfo.iconFileID or 134400
+                }
+                -- Cache it for future use
+                charData.currencyData[currencyID] = currInfo
+            end
+        end
+        
+        return currInfo
+    end
+    
     -- Convert to formatted objects
     local todayCurrenciesFormatted = {}
     local todayIncomeFormatted = {}
     local todayExpenseFormatted = {}
     for currencyID, change in pairs(todayCurrencies) do
-        local currInfo = currentCurrencies[currencyID] or charData.currencyData[currencyID]
+        local currInfo = GetCurrencyInfoWithFallback(currencyID)
         todayCurrenciesFormatted[currencyID] = {
             name = currInfo and currInfo.name or ("Currency " .. currencyID),
             change = change,
@@ -715,7 +737,7 @@ local function CalculateEarnings(playerName)
         }
     end
     for currencyID, income in pairs(todayIncome) do
-        local currInfo = currentCurrencies[currencyID] or charData.currencyData[currencyID]
+        local currInfo = GetCurrencyInfoWithFallback(currencyID)
         todayIncomeFormatted[currencyID] = {
             name = currInfo and currInfo.name or ("Currency " .. currencyID),
             change = income,
@@ -723,7 +745,7 @@ local function CalculateEarnings(playerName)
         }
     end
     for currencyID, expense in pairs(todayExpense) do
-        local currInfo = currentCurrencies[currencyID] or charData.currencyData[currencyID]
+        local currInfo = GetCurrencyInfoWithFallback(currencyID)
         todayExpenseFormatted[currencyID] = {
             name = currInfo and currInfo.name or ("Currency " .. currencyID),
             change = -expense,
@@ -735,7 +757,7 @@ local function CalculateEarnings(playerName)
     local weekIncomeFormatted = {}
     local weekExpenseFormatted = {}
     for currencyID, change in pairs(weekCurrencies) do
-        local currInfo = currentCurrencies[currencyID] or charData.currencyData[currencyID]
+        local currInfo = GetCurrencyInfoWithFallback(currencyID)
         weekCurrenciesFormatted[currencyID] = {
             name = currInfo and currInfo.name or ("Currency " .. currencyID),
             change = change,
@@ -743,7 +765,7 @@ local function CalculateEarnings(playerName)
         }
     end
     for currencyID, income in pairs(weekIncome) do
-        local currInfo = currentCurrencies[currencyID] or charData.currencyData[currencyID]
+        local currInfo = GetCurrencyInfoWithFallback(currencyID)
         weekIncomeFormatted[currencyID] = {
             name = currInfo and currInfo.name or ("Currency " .. currencyID),
             change = income,
@@ -751,7 +773,7 @@ local function CalculateEarnings(playerName)
         }
     end
     for currencyID, expense in pairs(weekExpense) do
-        local currInfo = currentCurrencies[currencyID] or charData.currencyData[currencyID]
+        local currInfo = GetCurrencyInfoWithFallback(currencyID)
         weekExpenseFormatted[currencyID] = {
             name = currInfo and currInfo.name or ("Currency " .. currencyID),
             change = -expense,
@@ -763,7 +785,7 @@ local function CalculateEarnings(playerName)
     local monthIncomeFormatted = {}
     local monthExpenseFormatted = {}
     for currencyID, change in pairs(monthCurrencies) do
-        local currInfo = currentCurrencies[currencyID] or charData.currencyData[currencyID]
+        local currInfo = GetCurrencyInfoWithFallback(currencyID)
         monthCurrenciesFormatted[currencyID] = {
             name = currInfo and currInfo.name or ("Currency " .. currencyID),
             change = change,
@@ -771,7 +793,7 @@ local function CalculateEarnings(playerName)
         }
     end
     for currencyID, income in pairs(monthIncome) do
-        local currInfo = currentCurrencies[currencyID] or charData.currencyData[currencyID]
+        local currInfo = GetCurrencyInfoWithFallback(currencyID)
         monthIncomeFormatted[currencyID] = {
             name = currInfo and currInfo.name or ("Currency " .. currencyID),
             change = income,
@@ -779,7 +801,7 @@ local function CalculateEarnings(playerName)
         }
     end
     for currencyID, expense in pairs(monthExpense) do
-        local currInfo = currentCurrencies[currencyID] or charData.currencyData[currencyID]
+        local currInfo = GetCurrencyInfoWithFallback(currencyID)
         monthExpenseFormatted[currencyID] = {
             name = currInfo and currInfo.name or ("Currency " .. currencyID),
             change = -expense,
@@ -800,6 +822,187 @@ local function CalculateEarnings(playerName)
     
     return sessionCurrencies, todayCurrenciesFormatted, weekCurrenciesFormatted, monthCurrenciesFormatted, currentCurrencies,
            sessionIncome, sessionExpense, todayIncomeFormatted, todayExpenseFormatted, weekIncomeFormatted, weekExpenseFormatted, monthIncomeFormatted, monthExpenseFormatted
+end
+
+-- Calculate earnings for all characters combined
+local function CalculateEarningsAllCharacters()
+    local totalSessionCurrencies = {}
+    local totalTodayCurrencies = {}
+    local totalWeekCurrencies = {}
+    local totalMonthCurrencies = {}
+    local totalSessionIncome = {}
+    local totalSessionExpense = {}
+    local totalTodayIncome = {}
+    local totalTodayExpense = {}
+    local totalWeekIncome = {}
+    local totalWeekExpense = {}
+    local totalMonthIncome = {}
+    local totalMonthExpense = {}
+    local allCurrencyInfo = {} -- To store name and icon info
+    
+    -- Iterate through all characters
+    for charName, charData in pairs(GoldLogDB.characters) do
+        local sessionCurrencies, todayCurrencies, weekCurrencies, monthCurrencies, currentCurrencies,
+              sessionIncome, sessionExpense, todayIncome, todayExpense, weekIncome, weekExpense, monthIncome, monthExpense = 
+              CalculateEarningsForCharacter(charData, charName)
+        
+        -- Sum up session
+        for currencyID, data in pairs(sessionCurrencies) do
+            if not totalSessionCurrencies[currencyID] then
+                totalSessionCurrencies[currencyID] = {
+                    name = data.name,
+                    change = 0,
+                    iconFileID = data.iconFileID
+                }
+                allCurrencyInfo[currencyID] = {name = data.name, iconFileID = data.iconFileID}
+            end
+            totalSessionCurrencies[currencyID].change = totalSessionCurrencies[currencyID].change + data.change
+        end
+        
+        -- Sum up today
+        for currencyID, data in pairs(todayCurrencies) do
+            if not totalTodayCurrencies[currencyID] then
+                totalTodayCurrencies[currencyID] = {
+                    name = data.name,
+                    change = 0,
+                    iconFileID = data.iconFileID
+                }
+                allCurrencyInfo[currencyID] = {name = data.name, iconFileID = data.iconFileID}
+            end
+            totalTodayCurrencies[currencyID].change = totalTodayCurrencies[currencyID].change + data.change
+        end
+        
+        -- Sum up week
+        for currencyID, data in pairs(weekCurrencies) do
+            if not totalWeekCurrencies[currencyID] then
+                totalWeekCurrencies[currencyID] = {
+                    name = data.name,
+                    change = 0,
+                    iconFileID = data.iconFileID
+                }
+                allCurrencyInfo[currencyID] = {name = data.name, iconFileID = data.iconFileID}
+            end
+            totalWeekCurrencies[currencyID].change = totalWeekCurrencies[currencyID].change + data.change
+        end
+        
+        -- Sum up month
+        for currencyID, data in pairs(monthCurrencies) do
+            if not totalMonthCurrencies[currencyID] then
+                totalMonthCurrencies[currencyID] = {
+                    name = data.name,
+                    change = 0,
+                    iconFileID = data.iconFileID
+                }
+                allCurrencyInfo[currencyID] = {name = data.name, iconFileID = data.iconFileID}
+            end
+            totalMonthCurrencies[currencyID].change = totalMonthCurrencies[currencyID].change + data.change
+        end
+        
+        -- Sum up session income/expense
+        for currencyID, data in pairs(sessionIncome) do
+            if not totalSessionIncome[currencyID] then
+                totalSessionIncome[currencyID] = {
+                    name = data.name,
+                    change = 0,
+                    iconFileID = data.iconFileID
+                }
+            end
+            totalSessionIncome[currencyID].change = totalSessionIncome[currencyID].change + data.change
+        end
+        
+        for currencyID, data in pairs(sessionExpense) do
+            if not totalSessionExpense[currencyID] then
+                totalSessionExpense[currencyID] = {
+                    name = data.name,
+                    change = 0,
+                    iconFileID = data.iconFileID
+                }
+            end
+            totalSessionExpense[currencyID].change = totalSessionExpense[currencyID].change + data.change
+        end
+        
+        -- Sum up today income/expense
+        for currencyID, data in pairs(todayIncome) do
+            if not totalTodayIncome[currencyID] then
+                totalTodayIncome[currencyID] = {
+                    name = data.name,
+                    change = 0,
+                    iconFileID = data.iconFileID
+                }
+            end
+            totalTodayIncome[currencyID].change = totalTodayIncome[currencyID].change + data.change
+        end
+        
+        for currencyID, data in pairs(todayExpense) do
+            if not totalTodayExpense[currencyID] then
+                totalTodayExpense[currencyID] = {
+                    name = data.name,
+                    change = 0,
+                    iconFileID = data.iconFileID
+                }
+            end
+            totalTodayExpense[currencyID].change = totalTodayExpense[currencyID].change + data.change
+        end
+        
+        -- Sum up week income/expense
+        for currencyID, data in pairs(weekIncome) do
+            if not totalWeekIncome[currencyID] then
+                totalWeekIncome[currencyID] = {
+                    name = data.name,
+                    change = 0,
+                    iconFileID = data.iconFileID
+                }
+            end
+            totalWeekIncome[currencyID].change = totalWeekIncome[currencyID].change + data.change
+        end
+        
+        for currencyID, data in pairs(weekExpense) do
+            if not totalWeekExpense[currencyID] then
+                totalWeekExpense[currencyID] = {
+                    name = data.name,
+                    change = 0,
+                    iconFileID = data.iconFileID
+                }
+            end
+            totalWeekExpense[currencyID].change = totalWeekExpense[currencyID].change + data.change
+        end
+        
+        -- Sum up month income/expense
+        for currencyID, data in pairs(monthIncome) do
+            if not totalMonthIncome[currencyID] then
+                totalMonthIncome[currencyID] = {
+                    name = data.name,
+                    change = 0,
+                    iconFileID = data.iconFileID
+                }
+            end
+            totalMonthIncome[currencyID].change = totalMonthIncome[currencyID].change + data.change
+        end
+        
+        for currencyID, data in pairs(monthExpense) do
+            if not totalMonthExpense[currencyID] then
+                totalMonthExpense[currencyID] = {
+                    name = data.name,
+                    change = 0,
+                    iconFileID = data.iconFileID
+                }
+            end
+            totalMonthExpense[currencyID].change = totalMonthExpense[currencyID].change + data.change
+        end
+    end
+    
+    -- Get current currencies for the active player (for display purposes)
+    local currentCurrencies = GetAllCurrencies()
+    
+    return totalSessionCurrencies, totalTodayCurrencies, totalWeekCurrencies, totalMonthCurrencies, currentCurrencies,
+           totalSessionIncome, totalSessionExpense, totalTodayIncome, totalTodayExpense, 
+           totalWeekIncome, totalWeekExpense, totalMonthIncome, totalMonthExpense
+end
+
+-- Wrapper function for backward compatibility (returns data for current player only)
+local function CalculateEarnings(playerName)
+    local charData = GoldLogDB.characters[playerName]
+    return CalculateEarningsForCharacter(charData, playerName)
 end
 
 -- Create the display frame
@@ -1011,9 +1214,9 @@ UpdateDisplay = function()
         end
     end
     
-    local playerName = UnitName("player") .. "-" .. GetRealmName()
+    -- Use combined data from all characters
     local sessionCurrencies, todayCurrencies, weekCurrencies, monthCurrencies, currentCurrencies,
-          sessionIncome, sessionExpense, todayIncome, todayExpense, weekIncome, weekExpense, monthIncome, monthExpense = CalculateEarnings(playerName)
+          sessionIncome, sessionExpense, todayIncome, todayExpense, weekIncome, weekExpense, monthIncome, monthExpense = CalculateEarningsAllCharacters()
     
     -- Select the correct data set based on active tab
     local displaySession, displayToday, displayWeek, displayMonth
@@ -1069,22 +1272,34 @@ UpdateDisplay = function()
         -- Collect unique currency IDs from all periods
         for currencyID, data in pairs(displaySession) do
             if GetCurrencyExpansion(currencyID) == expansion then
-                allExpCurrencies[currencyID] = true
+                -- In balance tab, only show if there's a change
+                if activeTab ~= "balance" or (data.change and data.change ~= 0) then
+                    allExpCurrencies[currencyID] = true
+                end
             end
         end
         for currencyID, data in pairs(displayToday) do
             if GetCurrencyExpansion(currencyID) == expansion then
-                allExpCurrencies[currencyID] = true
+                -- In balance tab, only show if there's a change
+                if activeTab ~= "balance" or (data.change and data.change ~= 0) then
+                    allExpCurrencies[currencyID] = true
+                end
             end
         end
         for currencyID, data in pairs(displayWeek) do
             if GetCurrencyExpansion(currencyID) == expansion then
-                allExpCurrencies[currencyID] = true
+                -- In balance tab, only show if there's a change
+                if activeTab ~= "balance" or (data.change and data.change ~= 0) then
+                    allExpCurrencies[currencyID] = true
+                end
             end
         end
         for currencyID, data in pairs(displayMonth) do
             if GetCurrencyExpansion(currencyID) == expansion then
-                allExpCurrencies[currencyID] = true
+                -- In balance tab, only show if there's a change
+                if activeTab ~= "balance" or (data.change and data.change ~= 0) then
+                    allExpCurrencies[currencyID] = true
+                end
             end
         end
         
@@ -1163,10 +1378,57 @@ UpdateDisplay = function()
                         maxChange = math.max(maxChange, math.abs(displayMonth[currencyID].change)) 
                     end
                     
-                    local name = (sessionData and sessionData.name) or (todayData and todayData.name) or ("Currency " .. currencyID)
+                    -- Try to get name from all available sources
+                    local name = (sessionData and sessionData.name) or 
+                                 (todayData and todayData.name) or 
+                                 (displayWeek[currencyID] and displayWeek[currencyID].name) or
+                                 (displayMonth[currencyID] and displayMonth[currencyID].name)
+                    
+                    -- If still not found, try to get from API directly
+                    if not name or name:match("^Currency %d+$") then
+                        if currencyID == 0 then
+                            name = "Gold"
+                        else
+                            local apiInfo = C_CurrencyInfo.GetCurrencyInfo(currencyID)
+                            if apiInfo and apiInfo.name then
+                                name = apiInfo.name
+                            else
+                                name = "Currency " .. currencyID
+                            end
+                        end
+                    end
+                    
                     -- Try to get icon from multiple sources
                     local currInfo = currentCurrencies[currencyID]
-                    local iconFileID = (currInfo and currInfo.iconFileID) or (sessionData and sessionData.iconFileID) or (todayData and todayData.iconFileID) or 134400
+                    local iconFileID = (currInfo and currInfo.iconFileID) or 
+                                       (sessionData and sessionData.iconFileID) or 
+                                       (todayData and todayData.iconFileID) or 
+                                       (displayWeek[currencyID] and displayWeek[currencyID].iconFileID) or 
+                                       (displayMonth[currencyID] and displayMonth[currencyID].iconFileID)
+                    
+                    -- If still not found, check all characters' currencyData
+                    if not iconFileID or iconFileID == 134400 then
+                        for charName, charData in pairs(GoldLogDB.characters) do
+                            if charData.currencyData and charData.currencyData[currencyID] and charData.currencyData[currencyID].iconFileID then
+                                iconFileID = charData.currencyData[currencyID].iconFileID
+                                break
+                            end
+                        end
+                    end
+                    
+                    -- Last resort: Try API directly
+                    if not iconFileID or iconFileID == 134400 then
+                        if currencyID == 0 then
+                            iconFileID = 133784 -- Gold icon
+                        else
+                            local apiInfo = C_CurrencyInfo.GetCurrencyInfo(currencyID)
+                            if apiInfo and apiInfo.iconFileID then
+                                iconFileID = apiInfo.iconFileID
+                            else
+                                iconFileID = 134400 -- Fallback icon
+                            end
+                        end
+                    end
                     
                     table.insert(sortedCurrencies, {
                         id = currencyID,
@@ -1243,7 +1505,7 @@ UpdateDisplay = function()
                     end
                     
                     -- Set currency name with icon
-                    rowFrame.nameText:SetText("|T" .. currEntry.iconFileID .. ":16:16:0:0|t " .. currEntry.name)
+                    rowFrame.nameText:SetText("|T" .. currEntry.iconFileID .. ":16:16:0:0:64:64:4:60:4:60|t " .. currEntry.name)
                     
                     -- Helper function to format currency value
                     local function FormatCurrencyValue(value, currencyID)
@@ -1325,18 +1587,34 @@ local function CreateDataBroker()
             if button == "LeftButton" then
                 ToggleFrame()
             elseif button == "RightButton" then
-                -- Reset session only
-                local playerName = UnitName("player") .. "-" .. GetRealmName()
-                if GoldLogDB.characters and GoldLogDB.characters[playerName] then
-                    -- Reset session start to current values
-                    local currentCurrencies = GetAllCurrencies()
-                    sessionStartCurrencies = {}
-                    for currencyID, data in pairs(currentCurrencies) do
-                        sessionStartCurrencies[currencyID] = data.quantity
-                    end
-                    print("|cff00ff00GoldLog:|r " .. L["SESSION_RESET"])
-                    UpdateDisplay()
-                end
+                -- Reset session only with confirmation
+                StaticPopupDialogs["GOLDLOG_SESSION_RESET"] = {
+                    text = L["SESSION_RESET_CONFIRM"],
+                    button1 = YES,
+                    button2 = NO,
+                    OnAccept = function()
+                        local playerName = UnitName("player") .. "-" .. GetRealmName()
+                        if GoldLogDB.characters and GoldLogDB.characters[playerName] then
+                            -- Reset session start to current values
+                            local currentCurrencies = GetAllCurrencies()
+                            local charData = GoldLogDB.characters[playerName]
+                            if not charData.sessionStart then
+                                charData.sessionStart = {}
+                            end
+                            for currencyID, data in pairs(currentCurrencies) do
+                                charData.sessionStart[currencyID] = data.quantity
+                            end
+                            charData.sessionStartTime = time()
+                            print("|cff00ff00GoldLog:|r " .. L["SESSION_RESET"])
+                            UpdateDisplay()
+                        end
+                    end,
+                    timeout = 0,
+                    whileDead = true,
+                    hideOnEscape = true,
+                    preferredIndex = 3,
+                }
+                StaticPopup_Show("GOLDLOG_SESSION_RESET")
             end
         end,
         
@@ -1344,14 +1622,13 @@ local function CreateDataBroker()
             tooltip:SetText("|cff00ff00" .. L["ADDON_NAME"] .. "|r", 1, 1, 1)
             tooltip:AddLine(" ")
             
-            local playerName = UnitName("player") .. "-" .. GetRealmName()
-            if not GoldLogDB.characters or not GoldLogDB.characters[playerName] then
+            if not GoldLogDB.characters or not next(GoldLogDB.characters) then
                 tooltip:AddLine(L["NO_DATA"])
                 tooltip:Show()
                 return
             end
             
-            local sessionCurrencies, todayCurrencies, weekCurrencies, monthCurrencies = CalculateEarnings(playerName)
+            local sessionCurrencies, todayCurrencies, weekCurrencies, monthCurrencies = CalculateEarningsAllCharacters()
             
             -- Show Gold first
             local goldSession = sessionCurrencies[0]
@@ -1415,13 +1692,12 @@ end
 local function UpdateDataBrokerText()
     if not dataObject then return end
     
-    local playerName = UnitName("player") .. "-" .. GetRealmName()
-    if not GoldLogDB.characters or not GoldLogDB.characters[playerName] then
+    if not GoldLogDB.characters or not next(GoldLogDB.characters) then
         dataObject.text = L["ADDON_NAME"]
         return
     end
     
-    local sessionCurrencies = CalculateEarnings(playerName)
+    local sessionCurrencies = CalculateEarningsAllCharacters()
     local goldData = sessionCurrencies[0]
     if goldData then
         local color = goldData.change >= 0 and "|cff00ff00" or "|cffff0000"
@@ -1456,7 +1732,7 @@ eventFrame:RegisterEvent("AUCTION_HOUSE_CLOSED")
 eventFrame:RegisterEvent("GUILDBANKFRAME_OPENED")
 eventFrame:RegisterEvent("GUILDBANKFRAME_CLOSED")
 
-eventFrame:SetScript("OnEvent", function(self, event, arg1)
+eventFrame:SetScript("OnEvent", function(self, event, arg1, arg2)
     if event == "ADDON_LOADED" and arg1 == ADDON_NAME then
         -- Initialize database
         local playerName = InitializeDB()
@@ -1468,6 +1744,9 @@ eventFrame:SetScript("OnEvent", function(self, event, arg1)
         end
         
     elseif event == "PLAYER_ENTERING_WORLD" then
+        local isLogin = arg1
+        local isReload = arg2
+        
         -- Ensure database is initialized
         if not GoldLogDB.characters then
             GoldLogDB.characters = {}
@@ -1475,35 +1754,49 @@ eventFrame:SetScript("OnEvent", function(self, event, arg1)
         
         local playerName = UnitName("player") .. "-" .. GetRealmName()
         
-        -- Initialize character data if needed
-        if not GoldLogDB.characters[playerName] then
-            GoldLogDB.characters[playerName] = {
-                dailyData = {},
-                currencies = {},
-                currencyData = {}
-            }
-        end
+        -- Initialize player name if needed
+        playerName = InitializeDB()
         
         local charData = GoldLogDB.characters[playerName]
-        
-        -- Initialize session start time
-        sessionStartTime = time()
-        
-        -- Initialize session currencies (including Gold as ID 0)
         local allCurrencies = GetAllCurrencies()
-        sessionStartCurrencies = {}
-        for currencyID, data in pairs(allCurrencies) do
-            sessionStartCurrencies[currencyID] = data.quantity
+        
+        -- Only reset session on actual login, not on reload or zone change
+        if isLogin then
+            -- Initialize session currencies (including Gold as ID 0)
+            if not charData.sessionStart then
+                charData.sessionStart = {}
+            end
+            for currencyID, data in pairs(allCurrencies) do
+                charData.sessionStart[currencyID] = data.quantity
+            end
+            charData.sessionStartTime = time()
+        else
+            -- On reload, ensure sessionStart is initialized if it doesn't exist
+            if not charData.sessionStart or next(charData.sessionStart) == nil then
+                charData.sessionStart = {}
+                for currencyID, data in pairs(allCurrencies) do
+                    charData.sessionStart[currencyID] = data.quantity
+                end
+                charData.sessionStartTime = time()
+            end
         end
         
         -- Also initialize charData currencies if not already done
         if not charData.currencies then
             charData.currencies = {}
         end
+        if not charData.currencyData then
+            charData.currencyData = {}
+        end
         for currencyID, data in pairs(allCurrencies) do
             if not charData.currencies[currencyID] then
                 charData.currencies[currencyID] = data.quantity
             end
+            -- Always update currency icon data
+            charData.currencyData[currencyID] = {
+                name = data.name,
+                iconFileID = data.iconFileID
+            }
         end
         
     elseif event == "PLAYER_MONEY" or event == "CURRENCY_DISPLAY_UPDATE" then
@@ -1617,7 +1910,8 @@ SlashCmdList["GOLDLOG"] = function(msg)
         }
         GoldLogDB.characters[playerName].currencies = {}
         GoldLogDB.characters[playerName].currencyData = {}
-        sessionStartCurrencies = {}
+        GoldLogDB.characters[playerName].sessionStart = {}
+        GoldLogDB.characters[playerName].sessionStartTime = 0
         print("|cff00ff00GoldLog:|r " .. L["RESET_CONFIRM"])
         UpdateDisplay()
     elseif msg == "reload" or msg == "fix" then
@@ -1640,10 +1934,16 @@ SlashCmdList["GOLDLOG"] = function(msg)
         print(L["VERSION"] .. ": 1.0.0")
         print(L["PLAYER"] .. ": " .. UnitName("player") .. "-" .. GetRealmName())
         
-        local playerName = UnitName("player") .. "-" .. GetRealmName()
-        local sessionCurrencies, todayCurrencies, weekCurrencies, monthCurrencies, currentCurrencies = CalculateEarnings(playerName)
+        local sessionCurrencies, todayCurrencies, weekCurrencies, monthCurrencies, currentCurrencies = CalculateEarningsAllCharacters()
         
-        -- Show Gold
+        -- Count total characters
+        local charCount = 0
+        for _ in pairs(GoldLogDB.characters) do
+            charCount = charCount + 1
+        end
+        print("|cff00ff00Charaktere:|r " .. charCount)
+        
+        -- Show Gold (total across all characters)
         local goldSession = sessionCurrencies[0]
         local goldToday = todayCurrencies[0]
         local goldWeek = weekCurrencies[0]

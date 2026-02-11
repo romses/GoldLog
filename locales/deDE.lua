@@ -44,6 +44,7 @@ L["DB_EXISTS"] = "DataBroker existiert bereits."
 L["RESET_CONFIRM"] = "Daten zurückgesetzt."
 L["DATA_RESET"] = "Alle Daten zurückgesetzt!"
 L["SESSION_RESET"] = "Session zurückgesetzt!"
+L["SESSION_RESET_CONFIRM"] = "Möchtest du die Session-Daten wirklich zurücksetzen?"
 
 -- Window
 L["FRAME_CREATED"] = "Hauptfenster erstellt."
